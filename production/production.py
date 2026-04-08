@@ -11,7 +11,7 @@ import pandas as pd
 import polars as pl
 from tqdm import tqdm
 
-from toolkit.logger import get_logger
+from toolkits.logger import get_logger
 
 data_root = os.getenv("DATA_ROOT") if os.getenv("DATA_ROOT") is not None else "./data"
 
