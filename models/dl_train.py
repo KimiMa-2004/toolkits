@@ -23,6 +23,23 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 
+def _split_batch(batch: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Normalize batch to ``(data, target|None)``.
+
+    Supports:
+    - ``(x, y)``
+    - ``(x,)`` / ``[x]``
+    - ``x`` (tensor only)
+    """
+    if isinstance(batch, (tuple, list)):
+        if len(batch) == 2:
+            return batch[0], batch[1]
+        if len(batch) == 1:
+            return batch[0], None
+        raise ValueError("batch must be (data, target) or (data,)")
+    return batch, None
+
+
 def _loader_len(loader: DataLoader) -> int | None:
     try:
         return len(loader)
@@ -74,6 +91,11 @@ def train_model(
 
     ``debug_mode``: 0 silent, 1 train-only prints, 2 train+test prints (needs ``test_loader``).
 
+    ``test_loader`` can yield either:
+        - ``(x, y)``: compute test loss/metric.
+        - ``(x,)`` or ``x``: skip evaluation and only output one prediction
+          (the last sample prediction seen in that epoch) in ``test_pred``.
+
     **Note**: call ``optimizer.zero_grad()`` each step — included here.
     """
     if mode not in ("cla", "reg"):
@@ -92,6 +114,7 @@ def train_model(
     total_test_losses: list[float] = []
     total_test_metrics: list[float] = []
     total_test_sampleses: list[int] = []
+    total_test_preds: list[float] = []
 
     for epoch in range(train_args.num_epochs):
         model.train()
@@ -104,7 +127,10 @@ def train_model(
             total=_loader_len(train_loader),
             desc=f"Epoch {epoch + 1}/{train_args.num_epochs}",
         )
-        for data, target in pbar:
+        for batch in pbar:
+            data, target = _split_batch(batch)
+            if target is None:
+                raise ValueError("train_loader must yield (data, target) batches")
             data = data.to(device, non_blocking=nb)
             target = target.to(device, non_blocking=nb)
             train_args.optimizer.zero_grad(set_to_none=True)
@@ -137,37 +163,51 @@ def train_model(
         epoch_test_loss = float("nan")
         epoch_test_metric = float("nan")
         n_test = 0
+        epoch_test_pred = float("nan")
+        has_test_target = False
 
         if test_loader is not None:
             model.eval()
             te_loss = 0.0
             te_metric_num = 0.0
             with torch.no_grad():
-                for data, target in test_loader:
+                for batch in test_loader:
+                    data, target = _split_batch(batch)
                     data = data.to(device, non_blocking=nb)
-                    target = target.to(device, non_blocking=nb)
                     output = model(data)
-                    loss = train_args.criterion(output, target)
                     bs = data.size(0)
+                    if mode == "cla":
+                        pred_tensor = output.argmax(dim=1)
+                        epoch_test_pred = float(pred_tensor[-1].item())
+                    else:
+                        epoch_test_pred = float(output.reshape(-1)[-1].item())
+
+                    if target is None:
+                        continue
+
+                    has_test_target = True
+                    target = target.to(device, non_blocking=nb)
+                    loss = train_args.criterion(output, target)
                     te_loss += _weighted_loss_sum(loss, bs)
                     n_test += bs
                     if mode == "cla":
-                        te_metric_num += (output.argmax(dim=1) == target).sum().item()
+                        te_metric_num += (pred_tensor == target).sum().item()
                     else:
                         te_metric_num += (output.float() - target.float()).pow(2).sum().item()
 
-            if n_test == 0:
-                raise RuntimeError("test_loader produced zero samples")
-            epoch_test_loss = te_loss / n_test
-            if mode == "cla":
-                epoch_test_metric = te_metric_num / n_test
-            else:
-                epoch_test_metric = te_metric_num / n_test
-
+            if has_test_target:
+                if n_test == 0:
+                    raise RuntimeError("test_loader produced zero samples")
+                epoch_test_loss = te_loss / n_test
+                if mode == "cla":
+                    epoch_test_metric = te_metric_num / n_test
+                else:
+                    epoch_test_metric = te_metric_num / n_test
+            model.train()
             total_test_losses.append(epoch_test_loss)
             total_test_metrics.append(epoch_test_metric)
             total_test_sampleses.append(n_test)
-            model.train()
+            total_test_preds.append(epoch_test_pred)
 
         if debug_mode == 1:
             if mode == "cla":
@@ -183,17 +223,31 @@ def train_model(
 
         if debug_mode == 2 and test_loader is not None:
             if mode == "cla":
-                print(
-                    f"Epoch {epoch + 1}/{train_args.num_epochs} | "
-                    f"train loss {epoch_train_loss:.4f} | acc {epoch_train_metric:.4f} | "
-                    f"test loss {epoch_test_loss:.4f} | acc {epoch_test_metric:.4f}"
-                )
+                if has_test_target:
+                    print(
+                        f"Epoch {epoch + 1}/{train_args.num_epochs} | "
+                        f"train loss {epoch_train_loss:.4f} | acc {epoch_train_metric:.4f} | "
+                        f"test loss {epoch_test_loss:.4f} | acc {epoch_test_metric:.4f}"
+                    )
+                else:
+                    print(
+                        f"Epoch {epoch + 1}/{train_args.num_epochs} | "
+                        f"train loss {epoch_train_loss:.4f} | acc {epoch_train_metric:.4f} | "
+                        f"test pred {epoch_test_pred:.4f}"
+                    )
             else:
-                print(
-                    f"Epoch {epoch + 1}/{train_args.num_epochs} | "
-                    f"train loss {epoch_train_loss:.4f} | RMSE {epoch_train_metric ** 0.5:.4f} | "
-                    f"test loss {epoch_test_loss:.4f} | RMSE {epoch_test_metric ** 0.5:.4f}"
-                )
+                if has_test_target:
+                    print(
+                        f"Epoch {epoch + 1}/{train_args.num_epochs} | "
+                        f"train loss {epoch_train_loss:.4f} | RMSE {epoch_train_metric ** 0.5:.4f} | "
+                        f"test loss {epoch_test_loss:.4f} | RMSE {epoch_test_metric ** 0.5:.4f}"
+                    )
+                else:
+                    print(
+                        f"Epoch {epoch + 1}/{train_args.num_epochs} | "
+                        f"train loss {epoch_train_loss:.4f} | RMSE {epoch_train_metric ** 0.5:.4f} | "
+                        f"test pred {epoch_test_pred:.4f}"
+                    )
 
     if model_save_path is not None:
         path = Path(model_save_path)
@@ -210,6 +264,7 @@ def train_model(
         rows["test_loss"] = total_test_losses
         rows["test_metric"] = total_test_metrics
         rows["test_samples"] = total_test_sampleses
+        rows["test_pred"] = total_test_preds
 
     return model, pd.DataFrame(rows)
 
@@ -280,23 +335,25 @@ def plot_losses_curve(res:pd.DataFrame, save_path:str=None, mode='cla'):
     if mode == 'cla':
         y_label = 'accuracy'
         y_data = res['train_metric']
-        y_data_test = res['test_metric']
+        y_data_test = res['test_metric'] if 'test_metric' in res else None
     else:
         y_label = 'rmse'
         y_data = res['train_metric']
-        y_data_test = res['test_metric']
+        y_data_test = res['test_metric'] if 'test_metric' in res else None
     fig, axes = plt.subplots(2, 1, figsize=(10, 8))
 
     # Accuracy or Rmse
     axes[0].plot(y_data, label='train ' + y_label)
-    axes[0].plot(y_data_test, label='test ' + y_label)
+    if y_data_test is not None and not pd.isna(y_data_test).all():
+        axes[0].plot(y_data_test, label='test ' + y_label)
     axes[0].set_xlabel('epoch')
     axes[0].set_ylabel(y_label)
     axes[0].grid(True, linestyle='--', alpha=0.45)
     axes[0].legend()
     # Loss
     axes[1].plot(res['train_loss'], label='train loss')
-    axes[1].plot(res['test_loss'], label='test loss')
+    if 'test_loss' in res and not pd.isna(res['test_loss']).all():
+        axes[1].plot(res['test_loss'], label='test loss')
     axes[1].set_xlabel('epoch')
     axes[1].set_ylabel('loss')
     axes[1].grid(True, linestyle='--', alpha=0.45)
